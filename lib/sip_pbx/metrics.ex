@@ -50,7 +50,8 @@ defmodule SipPbx.Metrics do
 
   @doc """
   Зарегистрировать гейдж — функцию `() -> number`, которую сэмплер опрашивает
-  каждый тик (например, глубину очереди или активные вызовы).
+  каждый тик (например, глубину очереди или активные вызовы). Если замыкание
+  падает, сэмпл этого тика пропускается — сэмплер не роняется.
   """
   @spec gauge(atom(), (-> number())) :: :ok
   def gauge(name, fun), do: GenServer.call(__MODULE__, {:gauge, name, fun})
@@ -107,7 +108,7 @@ defmodule SipPbx.Metrics do
         name
       end) ++
         Enum.map(state.gauges, fn {name, fun} ->
-          put_sample(name, now, fun.())
+          put_gauge_sample(name, now, fun)
           name
         end)
 
@@ -120,6 +121,18 @@ defmodule SipPbx.Metrics do
   def handle_info(_msg, state), do: {:noreply, state}
 
   defp put_sample(name, ts, value), do: :ets.insert(@series, {{name, ts}, value})
+
+  # Замыкания гейджей исполняются в процессе Metrics и в будущих задачах будут
+  # трогать другие процессы (например, GenServer.call на мёртвый pid) — ронять
+  # из-за них сэмплер вместе со всеми счётчиками нельзя, поэтому при падении
+  # просто пропускаем сэмпл этого тика.
+  defp put_gauge_sample(name, ts, fun) do
+    put_sample(name, ts, fun.())
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
+  end
 
   # кольцо на метрику: ключ {name, ts}, старее последних @series_len выбрасываем
   defp trim_series(name) do

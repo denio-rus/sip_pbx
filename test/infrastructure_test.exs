@@ -24,6 +24,32 @@ defmodule InfrastructureTest do
     assert hd(log).first == "e1001"
   end
 
+  test "падение гейджа не роняет Metrics — сэмпл тика пропущен" do
+    pid = Process.whereis(Metrics)
+    Metrics.gauge(:boom_gauge, fn -> raise "boom" end)
+    Metrics.incr(:pkt_out)
+
+    # синхронный get гарантирует, что cast и регистрация гейджа уже обработаны
+    assert Metrics.get(:pkt_out) >= 1
+    # как минимум один тик сэмплера с падающим гейджем
+    Process.sleep(1300)
+
+    # до фикса тик вёл бы к краху и перезапуску (новый pid, обнулённые счётчики)
+    assert Process.whereis(Metrics) == pid
+    assert Process.alive?(pid)
+    snap = Metrics.snapshot()
+    assert snap.counters.pkt_out >= 1
+    refute Map.has_key?(snap.series, :boom_gauge)
+  end
+
+  test "повторный subscribe удваивает доставку (Registry :duplicate)" do
+    PubSub.subscribe()
+    PubSub.subscribe()
+    PubSub.broadcast(:alert, :ping)
+    assert_receive :ping, 500
+    assert_receive :ping, 500
+  end
+
   test "счётчики и ряд сэмплера" do
     Metrics.incr(:pkt_in, 3)
     assert Metrics.get(:pkt_in) >= 3
