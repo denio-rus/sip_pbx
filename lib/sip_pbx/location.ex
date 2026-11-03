@@ -6,7 +6,8 @@ defmodule SipPbx.Location do
 
   Хранение — ETS `:public`: `lookup/2` и `list/1` читают напрямую, без GenServer'а;
   все записи сериализуются через процесс. Sweep раз в 10 с снимает истёкшие,
-  истёкший binding лениво удаляется и при `lookup/2`.
+  истёкший binding лениво удаляется и при `lookup/2` — ровно прочитанный объект
+  (`select_delete`), чтобы читатель не затёр свежего конкурента.
   """
 
   use GenServer
@@ -44,17 +45,19 @@ defmodule SipPbx.Location do
   end
 
   @doc """
-  Записать binding для AOR — один binding на AOR, fresh-wins (RFC 3261 §10.3):
-  новый перетирает предыдущий, если предыдущий к `now_ms` уже истёк или новый
-  живёт не меньше; запоздалый ретранслят старого REGISTER игнорируется.
-  `now_ms` — метка времени вызывающего (тесты детерминированы без реальных часов).
+  Записать binding для AOR — один binding на AOR: повторный REGISTER
+  перезаписывает binding безусловно, побеждает последний по порядку приёма
+  (спека §5; порядок задаёт сериализация записей через процесс). `now_ms` —
+  метка времени вызывающего, в записи не участвует: при last-wins порядок
+  REGISTER'ов важнее меток, а retransmit того же REGISTER перезаписывает
+  binding тем же содержимым.
 
   Это `call`, а не cast: читатель обязан видеть binding сразу после того, как
   Registrar получил `:ok` (иначе тесты и `POST /api/command` читают гонку).
   """
   @spec register(String.t(), binding(), integer()) :: :ok
-  def register(aor, %{} = binding, now_ms) do
-    GenServer.call(__MODULE__, {:register, aor, binding, now_ms})
+  def register(aor, %{} = binding, _now_ms) do
+    GenServer.call(__MODULE__, {:register, aor, binding})
   end
 
   @doc """
@@ -69,7 +72,10 @@ defmodule SipPbx.Location do
         if live?(b, now_ms) do
           b
         else
-          :ets.delete(@table, aor)
+          # select_delete, а не delete(aor): удаляем ровно прочитанный объект —
+          # если до удаления через GenServer успел закоммититься register того
+          # же AOR, шаблон не совпадёт и свежий binding переживёт чистку
+          :ets.select_delete(@table, [{{aor, b}, [], [true]}])
           nil
         end
 
@@ -110,8 +116,8 @@ defmodule SipPbx.Location do
   end
 
   @impl true
-  def handle_call({:register, aor, b, now_ms}, _from, state) do
-    if wins?(aor, b, now_ms), do: :ets.insert(@table, {aor, b})
+  def handle_call({:register, aor, b}, _from, state) do
+    :ets.insert(@table, {aor, b})
     {:reply, :ok, state}
   end
 
@@ -146,14 +152,6 @@ defmodule SipPbx.Location do
 
   @impl true
   def handle_info(_msg, state), do: {:noreply, state}
-
-  # fresh-wins: AOR свободен, предыдущий уже истёк к now_ms, или новый не менее свежий
-  defp wins?(aor, b, now_ms) do
-    case :ets.lookup(@table, aor) do
-      [] -> true
-      [{^aor, old}] -> old.expires_at <= now_ms or b.expires_at >= old.expires_at
-    end
-  end
 
   defp live?(b, now_ms), do: b.expires_at > now_ms
 

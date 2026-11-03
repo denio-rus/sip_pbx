@@ -35,6 +35,38 @@ defmodule SipPbx.LocationTest do
     assert Location.list(2_000) == %{}
   end
 
+  # Регресс на правку ревью: REGISTER с меньшим Expires (укорочение живого
+  # binding'а, например со второго девайса на том же AOR) обязан побеждать —
+  # иначе Registrar отвечает 200 OK, а маршрутизация идёт по старому контакту.
+  test "повторный REGISTER перезаписывает binding — последний побеждает" do
+    Location.register(
+      "sip:1005@pbx.local",
+      %{
+        contact: "long",
+        uri: "sip:e@h:5060",
+        received: {{1, 2, 3, 4}, 5060},
+        q: 1.0,
+        expires_at: 5_000
+      },
+      1_600
+    )
+
+    Location.register(
+      "sip:1005@pbx.local",
+      %{
+        contact: "short",
+        uri: "sip:f@h:5061",
+        received: {{1, 2, 3, 4}, 5061},
+        q: 1.0,
+        expires_at: 3_000
+      },
+      1_700
+    )
+
+    assert %{contact: "short", expires_at: 3_000} = Location.lookup("sip:1005@pbx.local", 1_800)
+    Location.unregister("sip:1005@pbx.local")
+  end
+
   # Порядок тестов внутри файла рандомизируется сидом, поэтому тест убирает за
   # собой все записи — иначе соседний `list/1` видел бы мусор.
   test "list режет истёкшие; drop_number снимает по номеру, не трогая соседей" do
