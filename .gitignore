@@ -2,3 +2,5 @@
 /_build/
 /tmp/
 
+.superpowers/
+erl_crash.dump
