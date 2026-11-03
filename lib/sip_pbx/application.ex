@@ -12,7 +12,8 @@ defmodule SipPbx.Application do
     children = [
       {Registry, keys: :duplicate, name: SipPbx.PubSub.Registry},
       {SipPbx.LogBuffer, capacity: 2000},
-      SipPbx.Metrics
+      SipPbx.Metrics,
+      SipPbx.Location
     ]
 
     Supervisor.start_link(children, strategy: :one_for_one, name: SipPbx.Supervisor)
