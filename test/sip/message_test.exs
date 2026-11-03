@@ -21,6 +21,11 @@ defmodule SipPbx.SIP.MessageTest do
     assert {:error, _} = Message.parse("SIP/2.0 неЧисло Ошибка\r\n\r\n")
   end
 
+  test "нечисловой CSeq — nil, без крэша (parse пропускает, читатель не падает)" do
+    {:ok, m} = Message.parse("INVITE sip:1002@pbx SIP/2.0\r\ncseq: abc INVITE\r\n\r\n")
+    assert Message.cseq(m) == nil
+  end
+
   test "канонический регистр при сборке + повторяемые заголовки по порядку" do
     bin =
       %Message{type: :request, method: "INVITE", uri: "sip:1002@pbx"}

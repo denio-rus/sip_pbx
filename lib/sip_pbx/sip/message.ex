@@ -198,9 +198,17 @@ defmodule SipPbx.SIP.Message do
         nil
 
       v ->
+        # Integer.parse, а не to_integer: входящий `CSeq: abc INVITE` — ошибка
+        # формата (nil), а не крэш у каждого, кто читает CSeq (review Task 2).
         case String.split(v, " ", parts: 2) do
-          [n, m] -> {String.to_integer(n), String.upcase(m)}
-          _ -> nil
+          [n, m] ->
+            case Integer.parse(n) do
+              {num, _rest} -> {num, String.upcase(m)}
+              :error -> nil
+            end
+
+          _ ->
+            nil
         end
     end
   end
