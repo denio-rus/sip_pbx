@@ -264,25 +264,3 @@ defmodule SipPbx.SIP.Transport do
 
   defp first_line(raw), do: raw |> String.split("\r\n") |> hd()
 end
-
-defmodule SipPbx.SIP.RouterSink do
-  @moduledoc """
-  Временный роутер транспорта: глушит всё (`handle_info/2` — no-op). Живого
-  трафика в тестах Tasks 7–10 нет; в Task 11 его сменит Registrar,
-  в Task 13 — Proxy.
-  """
-
-  use GenServer
-
-  @doc "Запустить поглотитель сообщений под именем `__MODULE__`."
-  @spec start_link(keyword()) :: GenServer.on_start()
-  def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-  end
-
-  @impl true
-  def init(_opts), do: {:ok, %{}}
-
-  @impl true
-  def handle_info(_msg, state), do: {:noreply, state}
-end

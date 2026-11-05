@@ -1,7 +1,7 @@
 defmodule SipPbx.Application do
   @moduledoc """
-  Надзиратель АТС: консистентные процессы (Location, Auth, Transport, Proxy,
-  LogBuffer, Metrics, Alerts) под `:one_for_one`, транзакции — ephemeral-детьми
+  Надзиратель АТС: консистентные процессы (Location, Auth, Registrar, Transport,
+  Proxy, LogBuffer, Metrics, Alerts) под `:one_for_one`, транзакции — ephemeral-детьми
   через `SipPbx.SIP.TxSupervisor`; консоль — рядом, её падение не должно ронять
   телефонию.
   """
@@ -18,11 +18,12 @@ defmodule SipPbx.Application do
       SipPbx.Alerts,
       # после Alerts: антибрутфорс зовёт block_ip/fire
       SipPbx.Auth,
-      # роутер-заглушка до Registrar (Task 11) / Proxy (Task 13)
-      SipPbx.SIP.RouterSink,
       # контейнер ephemeral-транзакций (§17): дети :temporary
       SipPbx.SIP.TxSupervisor,
-      {SipPbx.SIP.Transport, router: SipPbx.SIP.RouterSink}
+      # роутер транспорта до Proxy (Task 13); ДО Transport — тот шлёт ему
+      # почтой по имени, по незарегистрированному имени send/2 падает
+      SipPbx.Registrar,
+      {SipPbx.SIP.Transport, router: SipPbx.Registrar}
     ]
 
     Supervisor.start_link(children, strategy: :one_for_one, name: SipPbx.Supervisor)

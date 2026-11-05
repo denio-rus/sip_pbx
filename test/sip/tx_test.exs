@@ -167,21 +167,8 @@ defmodule SipPbx.SIP.TxServerTest do
     %{port: port}
   end
 
-  defp build_resp(req, code, reason) do
-    %Message{
-      type: :response,
-      status_code: code,
-      reason: reason,
-      headers: [
-        {"via", Message.header(req, "via")},
-        {"from", Message.header(req, "from")},
-        {"to", Message.header(req, "to")},
-        {"call-id", Message.header(req, "call-id")},
-        {"cseq", Message.header(req, "cseq")},
-        {"content-length", "0"}
-      ]
-    }
-  end
+  # общий хелпер из message.ex (Task 11) — дубль был ровно он же
+  defp build_resp(req, code, reason), do: Message.build_response(req, code, reason)
 
   defp invite_raw(branch) do
     "INVITE sip:b@y SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:#{uac_fixed()};branch=#{branch}\r\n" <>

@@ -378,6 +378,40 @@ defmodule SipPbx.SIP.Message do
   def to_binary(msg), do: IO.iodata_to_binary(to_iodata(msg))
 
   @doc """
+  Собрать ответ из запроса: все Via запроса стеком как есть (§18.2.1),
+  From/To/Call-ID/CSeq копиями, `Content-Length: 0`. Остальные заголовки
+  (`WWW-Authenticate`, `Contact`, …) — за вызывающим через `put_header/3`.
+  `to` копируется без tag: тегуются ответы диалога, а REGISTER диалога не
+  заводит (§17.2.3).
+
+  ## Examples
+
+      iex> req = %Message{type: :request, method: "REGISTER", uri: "sip:1001@pbx.local",
+      ...>   headers: [{"via", "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK1"}, {"cseq", "2 REGISTER"}]}
+      iex> resp = Message.build_response(req, 401, "Unauthorized")
+      iex> {resp.status_code, resp.reason, Message.headers(resp, "via"), Message.header(resp, "cseq")}
+      {401, "Unauthorized", ["SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK1"], "2 REGISTER"}
+
+  """
+  @spec build_response(t(), integer(), String.t()) :: t()
+  def build_response(%__MODULE__{} = req, code, reason) do
+    base = %__MODULE__{type: :response, status_code: code, reason: reason}
+
+    resp =
+      Enum.reduce(headers(req, "via"), base, &append_header(&2, "via", &1))
+
+    resp =
+      Enum.reduce(["from", "to", "call-id", "cseq"], resp, fn name, acc ->
+        case header(req, name) do
+          nil -> acc
+          value -> append_header(acc, name, value)
+        end
+      end)
+
+    put_header(resp, "content-length", "0")
+  end
+
+  @doc """
   Краткое человекочитаемое описание сообщения для лога.
 
   ## Examples
