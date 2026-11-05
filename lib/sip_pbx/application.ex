@@ -14,7 +14,10 @@ defmodule SipPbx.Application do
       {SipPbx.LogBuffer, capacity: 2000},
       SipPbx.Metrics,
       SipPbx.Location,
-      SipPbx.Alerts
+      SipPbx.Alerts,
+      # роутер-заглушка до Registrar (Task 11) / Proxy (Task 13)
+      SipPbx.SIP.RouterSink,
+      {SipPbx.SIP.Transport, router: SipPbx.SIP.RouterSink}
     ]
 
     Supervisor.start_link(children, strategy: :one_for_one, name: SipPbx.Supervisor)
