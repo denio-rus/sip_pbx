@@ -24,23 +24,28 @@ defmodule SipPbx.SIP.TxClient do
   @type kind :: :invite | :other
 
   @enforce_keys [:transport, :owner, :ref, :kind, :target, :msg, :branch]
-  defstruct transport: nil,
-            owner: nil,
-            ref: nil,
-            kind: :other,
-            target: nil,
-            msg: nil,
-            branch: nil,
-            t1: 0,
-            t2: 0,
-            # абсолютный дедлайн (monotonic, мс) — таймеры B/F/M
-            deadline: 0,
-            # автомат: :trying | :proceeding | :completed
-            st: :trying,
-            # текущий шаг ретранслята, мс
-            step: 0,
-            # ref последнего Process.send_after (:retrans) — гасится при смене фазы
-            timer: nil
+  defstruct [
+    :transport,
+    :owner,
+    :ref,
+    :kind,
+    :target,
+    :msg,
+    :branch,
+    # абсолютный дедлайн (monotonic, мс) — таймеры B/F/M
+    t1: 0,
+    t2: 0,
+    deadline: 0,
+    # автомат: :trying | :proceeding | :completed
+    st: :trying,
+    # текущий шаг ретранслята, мс
+    step: 0,
+    # ref последнего Process.send_after (:retrans) — гасится при смене фазы
+    timer: nil,
+    # поколение цепочки тиков: устаревшие {:retrans, gen} из mailbox
+    # игнорируются, cancel_timer не закрывает гонку «тик уже извлечён»
+    gen: 0
+  ]
 
   @doc """
   Запустить транзакцию и сразу отправить запрос: `:transport` — экземпляр
@@ -82,39 +87,45 @@ defmodule SipPbx.SIP.TxClient do
     :ok = Transport.reg_tx(state.transport, {:cli, branch}, self(), tx_kind(state.kind))
     Metrics.incr(:tx_started)
     send_request(state)
-    {:ok, %{state | timer: schedule_tick(t1)}}
+    {:ok, %{state | timer: schedule_tick(state.gen, t1)}}
   end
 
   # §17.1.2: один тик — либо ретранслят с удвоением шага, либо дедлайн B/F/M.
   # В Completed шаг фиксирован (T2), в Proceeding для INVITE — тик только
   # про дедлайн (Timer M), без ретранслята.
   @impl true
-  def handle_info(:retrans, %{st: :proceeding, kind: :invite} = state) do
+  def handle_info({:retrans, gen}, %{st: :proceeding, kind: :invite, gen: gen} = state) do
     if expired?(state) do
       timeout(state)
     else
       # Proceeding без ретранслята: тик остаётся только сторожем дедлайна
-      {:noreply, %{state | timer: schedule_tick(state.t2)}}
+      {:noreply, %{state | timer: schedule_tick(gen, state.t2)}}
     end
   end
 
-  def handle_info(:retrans, state) do
+  def handle_info({:retrans, gen}, %{gen: gen} = state) do
     if expired?(state) do
       timeout(state)
     else
       Metrics.incr(:retrans)
       send_request(state)
       step = if state.st == :completed, do: state.t2, else: min(state.step * 2, state.t2)
-      {:noreply, %{state | step: step, timer: schedule_tick(step)}}
+      {:noreply, %{state | step: step, timer: schedule_tick(gen, step)}}
     end
   end
 
+  # тик заменённой цепочки (гасили при входе в Completed) — молча мимо
+  def handle_info({:retrans, _stale_gen}, state), do: {:noreply, state}
+
   # ответ от Transport'а (кроме 2xx на INVITE — их он уводит роутеру)
 
-  # §17.1.2.2: в Completed ответы не обрабатываются — ретрансляты финального
-  # ответа и опоздавшие 1xx от UAS не должны вторично будить владельца
+  # §17.1.2.2: retransmitted final в Completed доставляется владельцу повторно
+  # (Proxy по нему повторяет ACK другой стороне); состояние и таймеры не трогаем
   @impl true
-  def handle_info({:tx_resp, _msg, _from}, %{st: :completed} = state), do: {:noreply, state}
+  def handle_info({:tx_resp, msg, _from}, %{st: :completed} = state) do
+    send(state.owner, {:tx_resp, state.ref, msg})
+    {:noreply, state}
+  end
 
   @impl true
   def handle_info({:tx_resp, msg, _from}, state) do
@@ -125,9 +136,14 @@ defmodule SipPbx.SIP.TxClient do
       {:noreply, %{state | st: :proceeding}}
     else
       # финал: Completed, ретранслят запроса каждые T2 до stop (Timer E/F);
-      # младый тик A/B гасится, иначе с T2-тика набегают двойные ретрансляты
+      # младый тик A/B гасится, а новая цепочка получает следующее поколение:
+      # тик, уже извлечённый из mailbox (cancel до него не дотянулся), будет
+      # проигнорирован по gen — иначе набегают двойные ретрансляты
       cancel_tick(state)
-      {:noreply, %{state | st: :completed, step: state.t2, timer: schedule_tick(state.t2)}}
+      gen = state.gen + 1
+
+      {:noreply,
+       %{state | st: :completed, step: state.t2, gen: gen, timer: schedule_tick(gen, state.t2)}}
     end
   end
 
@@ -157,7 +173,7 @@ defmodule SipPbx.SIP.TxClient do
     {:stop, :normal, state}
   end
 
-  defp schedule_tick(ms), do: Process.send_after(self(), :retrans, ms)
+  defp schedule_tick(gen, ms), do: Process.send_after(self(), {:retrans, gen}, ms)
 
   defp cancel_tick(%{timer: ref}) when is_reference(ref), do: Process.cancel_timer(ref)
   defp cancel_tick(_state), do: :ok

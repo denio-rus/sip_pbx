@@ -128,7 +128,13 @@ defmodule SipPbx.SIP.TxClientTest do
       )
 
     {:ok, inv} = UAC.recv(uac, 1000)
-    UAC.send_resp(uac, inv, 486, "Busy Here")
+    resp = UAC.send_resp(uac, inv, 486, "Busy Here")
+    assert_receive {:tx_resp, :r3, %Message{status_code: 486}}, 1000
+
+    # §17.1.2.2: retransmitted final в Completed доставляется владельцу повторно
+    # (Proxy по нему повторяет ACK) — дубль ответа шлём напрямую в транзакцию,
+    # маршрутизацию по branch Transport покрыл своими тестами
+    send(tx, {:tx_resp, resp, {{127, 0, 0, 1}, 5060}})
     assert_receive {:tx_resp, :r3, %Message{status_code: 486}}, 1000
 
     # Completed: запрос продолжает ретранслироваться (второй пакет в UAC)
