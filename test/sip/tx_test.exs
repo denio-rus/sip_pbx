@@ -142,3 +142,164 @@ defmodule SipPbx.SIP.TxClientTest do
     TxClient.stop(tx)
   end
 end
+
+defmodule SipPbx.SIP.TxServerTest do
+  use ExUnit.Case, async: false
+
+  alias SipPbx.{Alerts, Metrics}
+  alias SipPbx.SIP.{Message, Transport, TxServer}
+  alias SipPbxTest.{EchoRouter, UAC}
+
+  setup do
+    # эхо-роутер жив ДО транспорта: Transport шлёт роутеру send/2 по имени,
+    # неподписанное имя уронило бы транспорт на первом же пакете
+    {:ok, _echo} = EchoRouter.start_link(name: :tx_srv_echo, transport: :tx_cli_t)
+    {:ok, _} = Transport.start_link(port: 0, name: :tx_cli_t, router: :tx_srv_echo)
+    port = Transport.local_port(:tx_cli_t)
+
+    # Timer G/H этих тестов копят :retrans/:tx_timeout — подтверждаем свои
+    # алерты, чтобы active()-ассерты Task 14 не поплыли (carry из T6)
+    on_exit(fn ->
+      Alerts.ack(:retrans_spike)
+      Alerts.ack(:tx_timeout_rate)
+    end)
+
+    %{port: port}
+  end
+
+  defp build_resp(req, code, reason) do
+    %Message{
+      type: :response,
+      status_code: code,
+      reason: reason,
+      headers: [
+        {"via", Message.header(req, "via")},
+        {"from", Message.header(req, "from")},
+        {"to", Message.header(req, "to")},
+        {"call-id", Message.header(req, "call-id")},
+        {"cseq", Message.header(req, "cseq")},
+        {"content-length", "0"}
+      ]
+    }
+  end
+
+  defp invite_raw(branch) do
+    "INVITE sip:b@y SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:#{uac_fixed()};branch=#{branch}\r\n" <>
+      "From: <sip:a@y>;tag=t\r\nTo: <sip:b@y>\r\nCall-ID: sc\r\nCSeq: 3 INVITE\r\n" <>
+      "Content-Length: 0\r\n\r\n"
+  end
+
+  defp uac_fixed, do: 55161
+
+  test "IST: дубликат INVITE получает повтор 100 и 180; ACK гасит", %{port: port} do
+    {:ok, uac} = UAC.open(0)
+    {:ok, uac_port} = :inet.port(uac)
+    UAC.send_raw(uac, {{127, 0, 0, 1}, port}, invite_raw("z9hG4bKS1"))
+
+    {:ok, inv} = UAC.recv(uac, 1000)
+
+    {:ok, tx} =
+      TxServer.start_link(
+        transport: :tx_cli_t,
+        owner: self(),
+        kind: :invite,
+        msg: inv,
+        from: {{127, 0, 0, 1}, uac_port}
+      )
+
+    tx_ref = Process.monitor(tx)
+
+    TxServer.trying(tx)
+    assert {:ok, %Message{status_code: 100}} = UAC.recv(uac, 1000)
+    TxServer.respond(tx, build_resp(inv, 180, "Ringing"), false)
+    assert {:ok, %Message{status_code: 180}} = UAC.recv(uac, 1000)
+
+    # ретранслят INVITE (тот же branch) — повтор 180, логика не тревожится
+    UAC.send_raw(uac, {{127, 0, 0, 1}, port}, invite_raw("z9hG4bKS1"))
+    assert {:ok, %Message{status_code: 180}} = UAC.recv(uac, 1000)
+
+    TxServer.respond(tx, build_resp(inv, 486, "Busy Here"), true)
+    assert {:ok, %Message{status_code: 486}} = UAC.recv(uac, 1000)
+    # IST completed: сама ретранслирует 486 (Timer G)
+    assert {:ok, %Message{status_code: 486}} = UAC.recv(uac, 600)
+
+    # ACK с тем же branch — гасит транзакцию
+    UAC.send_raw(
+      uac,
+      {{127, 0, 0, 1}, port},
+      "ACK sip:y SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:#{uac_port};branch=z9hG4bKS1\r\n" <>
+        "From: <sip:a@y>;tag=t\r\nTo: <sip:b@y>\r\nCall-ID: sc\r\nCSeq: 3 INVITE\r\n" <>
+        "Content-Length: 0\r\n\r\n"
+    )
+
+    assert_receive {:tx_acked, {"z9hG4bKS1", "INVITE", 3}}, 1000
+
+    # после гибели terminate снял ОБА ключа (запроса и ACK) — DOWN приходит
+    # только после завершения terminate, гонки с tx_count нет
+    assert_receive {:DOWN, ^tx_ref, :process, ^tx, _}, 1000
+    assert Transport.tx_count(:tx_cli_t) == 0
+  end
+
+  test "NIST на BYE: final 200, дубликат → повтор 200, ACK гасит", %{port: port} do
+    {:ok, uac} = UAC.open(0)
+    {:ok, uac_port} = :inet.port(uac)
+
+    bye =
+      "BYE sip:b@y SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:55162;branch=z9hG4bKB1\r\n" <>
+        "From: <sip:a@y>;tag=t\r\nTo: <sip:b@y>\r\nCall-ID: sb\r\nCSeq: 5 BYE\r\n" <>
+        "Content-Length: 0\r\n\r\n"
+
+    UAC.send_raw(uac, {{127, 0, 0, 1}, port}, bye)
+    {:ok, req} = UAC.recv(uac, 1000)
+
+    from = {{127, 0, 0, 1}, uac_port}
+
+    {:ok, tx} =
+      TxServer.start_link(transport: :tx_cli_t, owner: self(), kind: :other, msg: req, from: from)
+
+    # реестрированы ОБА ключа — запроса и ACK ("ACK:" <> метод из CSeq);
+    # lookup_tx нужен и Proxy'у для матчинга CANCEL (§16.10)
+    assert Transport.lookup_tx(:tx_cli_t, {:srv, "z9hG4bKB1", "BYE", 5, from}) == tx
+    assert Transport.lookup_tx(:tx_cli_t, {:srv, "z9hG4bKB1", "ACK:BYE", 5, from}) == tx
+
+    TxServer.respond(tx, build_resp(req, 200, "OK"), true)
+    assert {:ok, %Message{status_code: 200}} = UAC.recv(uac, 1000)
+
+    # дубликат BYE — сам NIST ретранслирует 200 (получил дубликат → таймер, §17.2.2)
+    UAC.send_raw(uac, {{127, 0, 0, 1}, port}, bye)
+    assert {:ok, %Message{status_code: 200}} = UAC.recv(uac, 1000)
+
+    UAC.send_raw(
+      uac,
+      {{127, 0, 0, 1}, port},
+      "ACK sip:b@y SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:55162;branch=z9hG4bKB1\r\n" <>
+        "From: <sip:a@y>;tag=t\r\nTo: <sip:b@y>\r\nCall-ID: sb\r\nCSeq: 5 BYE\r\n" <>
+        "Content-Length: 0\r\n\r\n"
+    )
+
+    assert_receive {:tx_acked, {"z9hG4bKB1", "BYE", 5}}, 1000
+  end
+
+  test "IST без ACK: Timer H (64·T1) гасит транзакцию и будит владельца", %{port: port} do
+    {:ok, uac} = UAC.open(0)
+    {:ok, uac_port} = :inet.port(uac)
+    UAC.send_raw(uac, {{127, 0, 0, 1}, port}, invite_raw("z9hG4bKS9"))
+    {:ok, inv} = UAC.recv(uac, 1000)
+
+    {:ok, tx} =
+      TxServer.start_link(
+        transport: :tx_cli_t,
+        owner: self(),
+        kind: :invite,
+        msg: inv,
+        from: {{127, 0, 0, 1}, uac_port}
+      )
+
+    TxServer.respond(tx, build_resp(inv, 603, "Decline"), true)
+    t0 = System.monotonic_time(:millisecond)
+    # H = 64·20 = 1280 мс в тесте
+    assert_receive {:tx_timeout_owner, {"z9hG4bKS9", "INVITE", 3}}, 2500
+    assert System.monotonic_time(:millisecond) - t0 >= 1_100
+    refute Process.alive?(tx)
+  end
+end

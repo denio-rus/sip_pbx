@@ -1,8 +1,9 @@
 defmodule SipPbx.Application do
   @moduledoc """
   Надзиратель АТС: консистентные процессы (Location, Auth, Transport, Proxy,
-  LogBuffer, Metrics, Alerts) под `:one_for_one`; консоль — рядом, её падение
-  не должно ронять телефонию.
+  LogBuffer, Metrics, Alerts) под `:one_for_one`, транзакции — ephemeral-детьми
+  через `SipPbx.SIP.TxSupervisor`; консоль — рядом, её падение не должно ронять
+  телефонию.
   """
 
   use Application
@@ -17,6 +18,8 @@ defmodule SipPbx.Application do
       SipPbx.Alerts,
       # роутер-заглушка до Registrar (Task 11) / Proxy (Task 13)
       SipPbx.SIP.RouterSink,
+      # контейнер ephemeral-транзакций (§17): дети :temporary
+      SipPbx.SIP.TxSupervisor,
       {SipPbx.SIP.Transport, router: SipPbx.SIP.RouterSink}
     ]
 

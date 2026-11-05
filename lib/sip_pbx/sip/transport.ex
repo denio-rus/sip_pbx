@@ -91,6 +91,15 @@ defmodule SipPbx.SIP.Transport do
   @spec tx_count(server()) :: non_neg_integer()
   def tx_count(server \\ __MODULE__), do: GenServer.call(server, :tx_count)
 
+  @doc """
+  Владелец ключа: pid транзакции или `nil`. Читалка реестра для матчинга CANCEL
+  по §16.10 (Proxy, Task 13) — по ключу живой IST того же диалога. В окно
+  перезапуска транспорта call даёт exit `:noproc` — звать только из процессов,
+  для которых это приемлемо.
+  """
+  @spec lookup_tx(server(), tx_key()) :: pid() | nil
+  def lookup_tx(server \\ __MODULE__, key), do: GenServer.call(server, {:lookup_tx, key})
+
   @doc "Боевой порт сокета (актуально при `port: 0` в тестах)."
   @spec local_port(server()) :: :inet.port_number()
   def local_port(server \\ __MODULE__), do: GenServer.call(server, :local_port)
@@ -143,6 +152,13 @@ defmodule SipPbx.SIP.Transport do
   end
 
   def handle_call(:tx_count, _from, state), do: {:reply, :ets.info(state.tab, :size), state}
+
+  def handle_call({:lookup_tx, key}, _from, state) do
+    case :ets.lookup(state.tab, key) do
+      [{^key, {pid, _kind}}] -> {:reply, pid, state}
+      [] -> {:reply, nil, state}
+    end
+  end
 
   def handle_call(:local_port, _from, state) do
     {:ok, port} = :inet.port(state.sock)
