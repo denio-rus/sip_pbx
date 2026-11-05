@@ -106,6 +106,41 @@ defmodule SipPbx.AuthTest do
     Alerts.ack(:blocked_ip)
   end
 
+  test "устаревшее окно фейлов обнуляется: >10 считаются в пределах 30 с" do
+    ip = {203, 0, 113, 8}
+    {nonce, _} = Auth.challenge(ip)
+    now = System.system_time(:millisecond)
+
+    # now_ms у now_ms-окна фейлов общий с проверкой nonce, а TTL nonce (5 мин)
+    # больше окна (30 с) — сдвигаем часы на >окна, digest остаётся сверяемым
+    fail = fn shift ->
+      msg =
+        register_req(
+          auth_value(nonce, "wrong#{shift}",
+            nc: String.pad_leading(Integer.to_string(shift, 16), 8, "0")
+          )
+        )
+
+      assert :forbidden == Auth.verify(msg, ip, now_ms: now + shift)
+    end
+
+    for i <- 1..10, do: fail.(i)
+    refute Alerts.blocked?(ip)
+
+    # окно протухло — счётчик стартует заново, единственный фейл не банит
+    fail.(31_001)
+    refute Alerts.blocked?(ip)
+
+    # и только >10 фейлов внутри одного живого окна
+    for i <- 31_002..31_011, do: fail.(i)
+    assert Alerts.blocked?(ip)
+    assert Enum.any?(Alerts.active(), &(&1.rule == :auth_burst))
+
+    Alerts.unblock(ip)
+    Alerts.ack(:auth_burst)
+    Alerts.ack(:blocked_ip)
+  end
+
   test "INVITE читает Proxy-Authorization, REGISTER — Authorization" do
     ip = {203, 0, 113, 5}
     {nonce, _} = Auth.challenge(ip)

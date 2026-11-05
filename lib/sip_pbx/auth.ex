@@ -207,9 +207,15 @@ defmodule SipPbx.Auth do
       [{^ip, start_ms, _count}] when now_ms - start_ms < @burst_window_ms ->
         bump(ip, :ets.update_counter(@fails_table, ip, {3, 1}))
 
-      _ ->
-        # окна нет или оно устарело — заводим новое; если параллельный писатель
-        # опередил, insert_new сохранит его окно, а инкремент попадёт в него
+      [{^ip, _start_ms, _count}] ->
+        # окно протухло — именно перетираем запись: insert_new на живом ключе
+        # no-op, и инкремент осел бы на старый счётчик («окно за 30 с»
+        # превратилось бы в пожизненное); цена — съеденный гонкой инкремент,
+        # та же, что обоснована над record_fail
+        :ets.insert(@fails_table, {ip, now_ms, 0})
+        bump(ip, :ets.update_counter(@fails_table, ip, {3, 1}))
+
+      [] ->
         :ets.insert_new(@fails_table, {ip, now_ms, 0})
         bump(ip, :ets.update_counter(@fails_table, ip, {3, 1}))
     end
