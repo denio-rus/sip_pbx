@@ -16,6 +16,8 @@ defmodule SipPbx.Application do
       SipPbx.Metrics,
       SipPbx.Location,
       SipPbx.Alerts,
+      # после Alerts: антибрутфорс зовёт block_ip/fire
+      SipPbx.Auth,
       # роутер-заглушка до Registrar (Task 11) / Proxy (Task 13)
       SipPbx.SIP.RouterSink,
       # контейнер ephemeral-транзакций (§17): дети :temporary
