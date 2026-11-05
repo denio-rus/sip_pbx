@@ -20,6 +20,7 @@ defmodule SipPbx.SIP.TxClientTest do
 
   setup do
     {:ok, sink} = start_supervised({Sink, self()})
+    await_name_free(:tx_cli_t)
     {:ok, _} = Transport.start_link(port: 0, name: :tx_cli_t, router: sink)
     port = Transport.local_port(:tx_cli_t)
 
@@ -32,6 +33,27 @@ defmodule SipPbx.SIP.TxClientTest do
 
     # t1_ms=20 из config/test.exs: B/F = 1280 мс, шаг 20·2^n с потолком 160
     %{port: port}
+  end
+
+  # транспорт связан с процессом теста и умирает асинхронно уже после его
+  # выхода: следующий setup, стартующий раньше освобождения имени, ловил
+  # {:error, {:already_started, _}} (flaky при неудачном порядке)
+  defp await_name_free(name) do
+    case Process.whereis(name) do
+      nil ->
+        :ok
+
+      pid ->
+        ref = Process.monitor(pid)
+        Process.exit(pid, :kill)
+
+        receive do
+          {:DOWN, ^ref, :process, ^pid, _} -> :ok
+        after
+          # pid мог зарегистрироваться уже после whereis — не ждём вечно
+          1_000 -> :ok
+        end
+    end
   end
 
   defp req(method, branch) do
@@ -153,6 +175,8 @@ defmodule SipPbx.SIP.TxServerTest do
   setup do
     # эхо-роутер жив ДО транспорта: Transport шлёт роутеру send/2 по имени,
     # неподписанное имя уронило бы транспорт на первом же пакете
+    await_name_free(:tx_srv_echo)
+    await_name_free(:tx_cli_t)
     {:ok, _echo} = EchoRouter.start_link(name: :tx_srv_echo, transport: :tx_cli_t)
     {:ok, _} = Transport.start_link(port: 0, name: :tx_cli_t, router: :tx_srv_echo)
     port = Transport.local_port(:tx_cli_t)
@@ -168,6 +192,25 @@ defmodule SipPbx.SIP.TxServerTest do
   end
 
   # общий хелпер из message.ex (Task 11) — дубль был ровно он же
+  # см. комментарий await_name_free/1 в TxClientTest — тот же гоночный сценарий
+  defp await_name_free(name) do
+    case Process.whereis(name) do
+      nil ->
+        :ok
+
+      pid ->
+        ref = Process.monitor(pid)
+        Process.exit(pid, :kill)
+
+        receive do
+          {:DOWN, ^ref, :process, ^pid, _} -> :ok
+        after
+          # pid мог зарегистрироваться уже после whereis — не ждём вечно
+          1_000 -> :ok
+        end
+    end
+  end
+
   defp build_resp(req, code, reason), do: Message.build_response(req, code, reason)
 
   defp invite_raw(branch) do

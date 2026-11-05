@@ -9,6 +9,14 @@ defmodule SipPbx.RegistrarTest do
     # приложение поднято test_helper'ом (Task 1): Transport+Registrar работают
     port = SipPbx.SIP.Transport.local_port()
     {:ok, sock} = UAC.open(0)
+
+    # binding живёт min_expires (60 с) и переживает тест: без уборки при
+    # неудачном порядке LocationTest увидел бы чужие bindings в list/1
+    on_exit(fn ->
+      Location.unregister("sip:1001@pbx.local")
+      Location.unregister("sip:1002@pbx.local")
+    end)
+
     %{sock: sock, target: {{127, 0, 0, 1}, port}}
   end
 
