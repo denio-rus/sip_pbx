@@ -11,8 +11,10 @@ defmodule SipPbx.SIP.TxServer do
   Автомат trying→proceeding→completed (INVITE) / trying→completed (NIST).
   IST в completed ретранслирует final по Timer G (шаг `T1·2^n`, потолок T2) до
   дедлайна Timer H = 64·T1 — там `{:tx_timeout_owner, ref}` и гибель; NIST не
-  ретранслирует по таймеру вовсе (только по дубликатам запроса), но живёт те же
-  64·T1 (Timer D в упрощении плана). Процесс ephemeral (`:temporary`), живёт под
+  ретранслирует по таймеру вовсе (только по дубликатам запроса), живёт те же
+  64·T1 (Timer D в упрощении плана) и на истечении D умирает молча: финал
+  отправлял сам владелец, считать это таймаутом — плодить ложные
+  `tx_timeout_rate`. Процесс ephemeral (`:temporary`), живёт под
   `SipPbx.SIP.TransactionSupervisor`. Константы — только из env `:t1_ms`.
   """
 
@@ -50,10 +52,13 @@ defmodule SipPbx.SIP.TxServer do
     step: 0,
     # ref последнего Process.send_after (:retrans)
     timer: nil,
-    # ключи уже сняты до уведомления владельца (terminate — страховка только
-    # для внешних stop/kill, иначе живой terminate успевает выиграть гонку
-    # с refute Process.alive?/1 у получателя сообщения)
+    # ключи уже сняты до выхода (terminate — страховка только для внешних
+    # stop/kill); письмо владельцу из terminate, процесс уже exiting —
+    # получатель не застанет транзакцию живой (гонка refute Process.alive?/1)
     cleaned: false,
+    # что послать владельцу в terminate (:tx_acked/:tx_timeout_owner по ref);
+    # nil — тихий выход (NIST по D, внешний stop)
+    notify: nil,
     # поколение цепочки тиков: устаревшие {:retrans, gen} игнорируются
     # (cancel_timer не закрывает гонку «тик уже извлечён», как в TxClient)
     gen: 0
@@ -83,10 +88,22 @@ defmodule SipPbx.SIP.TxServer do
   заголовками): `final? = false` — 1xx, транзакция в Proceeding; `final? = true`
   — финал, переход в Completed со всеми ретранслятами. Ответ в Completed больше
   не меняется (повторный вызов игнорируется).
+
+  2xx завершает диалог, а не транзакцию: держим её до ACK/D штатно, но
+  сделавшему своё владельцу (Registrar после 200 OK, Proxy после форварда ACK)
+  ждать 64·T1 рано — ранний выход: `stop/1` (или
+  `DynamicSupervisor.terminate_child(TransactionSupervisor, tx)`).
   """
   @spec respond(GenServer.server(), Message.t(), boolean()) :: :ok
   def respond(tx, %Message{} = response, final?),
     do: GenServer.call(tx, {:respond, response, final?})
+
+  @doc """
+  Погасить транзакцию досрочно (сделали своё после финального ответа —
+  выжидать Timer D/hold для ACK смысла нет). Ключи реестра снимает terminate.
+  """
+  @spec stop(GenServer.server()) :: :ok
+  def stop(tx), do: GenServer.stop(tx)
 
   @impl true
   def init(opts) do
@@ -156,42 +173,52 @@ defmodule SipPbx.SIP.TxServer do
     end
   end
 
-  # §17.2.1: тик живёт только в Completed. IST — ретранслят final (Timer G,
-  # шаг T1·2^n с потолком T2) до дедлайна H = 64·T1; NIST тикает ровно один раз
-  # на дедлайне D = 64·T1 (ретранслят — исключительно по дубликатам запроса).
+  # §17.2.1: тик IST — ретранслят final (Timer G, шаг T1·2^n с потолком T2)
+  # до дедлайна H = 64·T1, там уведомление владельцу и гибель
   @impl true
-  def handle_info({:retrans, gen}, %{st: :completed, gen: gen} = state) do
+  def handle_info({:retrans, gen}, %{st: :completed, kind: :invite, gen: gen} = state) do
     if expired?(state) do
       timeout(state)
     else
-      case state.kind do
-        :invite ->
-          Metrics.incr(:retrans)
-          send_response(state, state.last_resp)
-          step = min(state.step * 2, state.t2)
-          {:noreply, %{state | step: step, timer: schedule_tick(gen, step)}}
+      Metrics.incr(:retrans)
+      send_response(state, state.last_resp)
+      step = min(state.step * 2, state.t2)
+      {:noreply, %{state | step: step, timer: schedule_tick(gen, step)}}
+    end
+  end
 
-        :other ->
-          # проспал дедлайн на наносекунды — переставляемся на остаток
-          {:noreply, %{state | timer: schedule_tick(gen, remaining(state))}}
-      end
+  # §17.2.2: тик NIST стоит ровно один раз на дедлайне D = 64·T1 (ретранслят —
+  # исключительно по дубликатам запроса). D истёк — тихая гибель: финальный
+  # ответ отправлял сам владелец, {:tx_timeout_owner} здесь был бы шумом,
+  # а :tx_timeout на каждом живом 200 OK ложно поднимал tx_timeout_rate
+  def handle_info({:retrans, gen}, %{st: :completed, kind: :other, gen: gen} = state) do
+    if expired?(state) do
+      {:stop, :normal, state}
+    else
+      # проспал дедлайн на наносекунды — переставляемся на остаток
+      {:noreply, %{state | timer: schedule_tick(gen, remaining(state))}}
     end
   end
 
   # тик заменённой цепочки — молча мимо (gen-схема как в TxClient)
   def handle_info({:retrans, _stale_gen}, state), do: {:noreply, state}
 
-  # ACK из Transport (приходит как {:tx_dup, ...} по ACK-ключу): в Completed —
-  # гибель с уведомлением; Timer I/Confirmed с выдержкой в упрощении не заводим
-  # (ACK по branch у нас надёжно матчуется вторым ключом)
+  # ACK из Transport (приходит как {:tx_dup, ...} по ACK-ключу). §17.2.1:
+  # доставка тушке обязательна и вне Completed (ACK может обогнать final —
+  # гонка ретранслятов; Proxy T13 по {:tx_acked, ref} ре-форвардит ACK).
+  # В Completed ACK дополнительно гасит транзакцию; Timer I/Confirmed с
+  # выдержкой в упрощении не заводим (ACK по branch надёжно матчуется
+  # вторым ключом)
   @impl true
   def handle_info({:tx_dup, %Message{method: "ACK"}, _from}, %{st: :completed} = state) do
     state = cleanup_keys(state)
-    send(state.owner, {:tx_acked, state.ref})
-    {:stop, :normal, state}
+    {:stop, :normal, %{state | notify: {:tx_acked, state.ref}}}
   end
 
-  def handle_info({:tx_dup, %Message{method: "ACK"}, _from}, state), do: {:noreply, state}
+  def handle_info({:tx_dup, %Message{method: "ACK"}, _from}, state) do
+    send(state.owner, {:tx_acked, state.ref})
+    {:noreply, state}
+  end
 
   # дубликат запроса: авто-ретранслят последнего ответа (Trying — повтор 100,
   # Proceeding — последнего 1xx, Completed — final), §17.2.1/§17.2.2 и
@@ -210,14 +237,16 @@ defmodule SipPbx.SIP.TxServer do
   @impl true
   def handle_info(_msg, state), do: {:noreply, state}
 
+  # Уведомление — здесь, не в handle_info: к моменту, когда владелец читает
+  # {:tx_acked, ref}/{:tx_timeout_owner, ref}, процесс уже exiting — никаких
+  # «живой транзакции» под assert'ами. Снятие ключей — только для нештатных
+  # выходов (внешний stop/kill): штатные сняли до stop; в окно перезапуска
+  # транспорта не роняемся (carry из ревью T8), monitor транспорта — страховка
   @impl true
-  def terminate(_reason, %{cleaned: true}), do: :ok
-
-  # штатные выходы (ACK, H/D) снимают ключи сами; остаётся внешний stop/kill —
-  # в окно перезапуска транспорта не роняемся (carry из ревью T8), а monitor
-  # транспорта вычистит ключи по нашей смерти в любом случае
   def terminate(_reason, state) do
-    unreg_keys(state)
+    unless state.cleaned, do: unreg_keys(state)
+    if state.notify, do: send(state.owner, state.notify)
+    :ok
   catch
     :exit, _ -> :ok
   end
@@ -286,8 +315,7 @@ defmodule SipPbx.SIP.TxServer do
   defp timeout(state) do
     Metrics.incr(:tx_timeout)
     state = cleanup_keys(state)
-    send(state.owner, {:tx_timeout_owner, state.ref})
-    {:stop, :normal, state}
+    {:stop, :normal, %{state | notify: {:tx_timeout_owner, state.ref}}}
   end
 
   defp schedule_tick(gen, ms), do: Process.send_after(self(), {:retrans, gen}, ms)

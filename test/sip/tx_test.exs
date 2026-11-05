@@ -302,4 +302,67 @@ defmodule SipPbx.SIP.TxServerTest do
     assert System.monotonic_time(:millisecond) - t0 >= 1_100
     refute Process.alive?(tx)
   end
+
+  test "ACK раньше финального ответа (§17.2.1 гонка) — доставлен, но не гасит", %{port: port} do
+    {:ok, uac} = UAC.open(0)
+    {:ok, uac_port} = :inet.port(uac)
+    from = {{127, 0, 0, 1}, uac_port}
+    UAC.send_raw(uac, {{127, 0, 0, 1}, port}, invite_raw("z9hG4bKS7"))
+    {:ok, inv} = UAC.recv(uac, 1000)
+
+    {:ok, tx} =
+      TxServer.start_link(
+        transport: :tx_cli_t,
+        owner: self(),
+        kind: :invite,
+        msg: inv,
+        from: from
+      )
+
+    # ACK обогнал final: §17.2.1 требует доставки тушке и вне Completed,
+    # но транзакция живёт и отвечает штатно (Proxy T13 ждёт {:tx_acked, ref}
+    # для ре-форварда ACK)
+    UAC.send_raw(
+      uac,
+      {{127, 0, 0, 1}, port},
+      "ACK sip:y SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:#{uac_port};branch=z9hG4bKS7\r\n" <>
+        "From: <sip:a@y>;tag=t\r\nTo: <sip:b@y>\r\nCall-ID: sc\r\nCSeq: 3 INVITE\r\n" <>
+        "Content-Length: 0\r\n\r\n"
+    )
+
+    assert_receive {:tx_acked, {"z9hG4bKS7", "INVITE", 3}}, 1000
+    assert Process.alive?(tx)
+
+    TxServer.respond(tx, build_resp(inv, 486, "Busy Here"), true)
+    assert {:ok, %Message{status_code: 486}} = UAC.recv(uac, 1000)
+
+    # ранний выход после дела (тот же путь, что документирует respond/3)
+    TxServer.stop(tx)
+  end
+
+  test "NIST: истечение D (64·T1) — тихая гибель, ни письма, ни :tx_timeout", %{port: port} do
+    {:ok, uac} = UAC.open(0)
+    {:ok, uac_port} = :inet.port(uac)
+    from = {{127, 0, 0, 1}, uac_port}
+
+    bye =
+      "BYE sip:b@y SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:55164;branch=z9hG4bKB9\r\n" <>
+        "From: <sip:a@y>;tag=t\r\nTo: <sip:b@y>\r\nCall-ID: sd\r\nCSeq: 5 BYE\r\n" <>
+        "Content-Length: 0\r\n\r\n"
+
+    UAC.send_raw(uac, {{127, 0, 0, 1}, port}, bye)
+    {:ok, req} = UAC.recv(uac, 1000)
+
+    {:ok, tx} =
+      TxServer.start_link(transport: :tx_cli_t, owner: self(), kind: :other, msg: req, from: from)
+
+    ref = Process.monitor(tx)
+    TxServer.respond(tx, build_resp(req, 200, "OK"), true)
+    assert {:ok, %Message{status_code: 200}} = UAC.recv(uac, 1000)
+
+    # D = 64·20 = 1280 мс; DOWN guarantee: всё, что транзакция могла послать,
+    # уже в mailbox — значит письмо про D не приходит вовсе (фикс Important 1)
+    assert_receive {:DOWN, ^ref, :process, ^tx, :normal}, 2000
+    refute_receive {:tx_timeout_owner, _}, 50
+  end
 end

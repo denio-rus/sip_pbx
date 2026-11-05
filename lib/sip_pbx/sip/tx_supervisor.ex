@@ -32,7 +32,9 @@ defmodule SipPbx.SIP.TxSupervisor do
       Supervisor.child_spec(
         {DynamicSupervisor, name: SipPbx.SIP.TransactionSupervisor, strategy: :one_for_one},
         id: SipPbx.SIP.TransactionSupervisor,
-        restart: :temporary
+        # сам контейнер — permanent (его потеря останавливает приём транзакций
+        # до рестарта приложения); ephemeral-политика — у детей-транзакций
+        restart: :permanent
       )
     ]
 
