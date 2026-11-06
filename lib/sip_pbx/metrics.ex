@@ -15,7 +15,12 @@ defmodule SipPbx.Metrics do
   * `:tx_started`, `:tx_timeout` — транзакции начаты/истекли;
   * `:retrans` — отправлено ретрансляций;
   * `:call_started`, `:call_ok`, `:call_fail` — исходящие вызовы;
-  * `:bye_done`, `:cancel_done` — завершены по BYE / CANCEL.
+  * `:call_active` — подтверждён ACK'ом (диалог жив);
+  * `:bye_done`, `:cancel_done` — завершены по BYE / CANCEL;
+  * `:tx_503` — отказ по лимиту живых транзакций (`:max_tx`).
+
+  Коды ответов в счётчики не заводятся (ruling T13): детализация по кодам —
+  в журнале `SipPbx.LogBuffer`, здесь только итоговые имена выше.
   """
 
   use GenServer

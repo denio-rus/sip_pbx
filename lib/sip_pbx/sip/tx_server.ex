@@ -105,6 +105,25 @@ defmodule SipPbx.SIP.TxServer do
   @spec stop(GenServer.server()) :: :ok
   def stop(tx), do: GenServer.stop(tx)
 
+  @doc """
+  Для INVITE-IST, которой прокси уже доставил 2xx в обход транзакции
+  (§13.2.2.4: 2xx не проходит IST): снять ключ запроса, ПЕРЕрегистрировать
+  ACK-ключ на `new_owner` (2xx-ACK идёт с тем же branch и попадёт новому
+  владельцу как `{:tx_dup, ...}`), снять G/H и погасить IST. Письем владельцу
+  не уведомляем — он и есть `new_owner`, переводит диалог в active сам.
+  """
+  @spec transfer_ack(GenServer.server(), pid()) :: :ok
+  def transfer_ack(tx, new_owner), do: GenServer.call(tx, {:transfer_ack, new_owner})
+
+  @doc """
+  «ACK найден прокси по диалогу»: ACK на non-2xx приходит с НОВЫМ branch
+  (§17.1.1.3) и транспортным ключом не матчится — прокси нашёл IST по Call-ID
+  и гасит её вручную: ретрансляты сняты, IST мертва, владельцу — штатное
+  `{:tx_acked, ref}` (ветка чистки одна для обоих путей ACK).
+  """
+  @spec external_ack(GenServer.server()) :: :ok
+  def external_ack(tx), do: GenServer.call(tx, :external_ack)
+
   @impl true
   def init(opts) do
     t1 = Application.fetch_env!(:sip_pbx, :t1_ms)
@@ -171,6 +190,28 @@ defmodule SipPbx.SIP.TxServer do
     else
       {:reply, :ok, %{state | st: :proceeding}}
     end
+  end
+
+  # перевод ACK-ключа на нового владельца (Proxy) и гибель IST: ключ запроса
+  # снимается — дубликаты INVITE после 2xx прокси разберёт сам; ACK-ключ
+  # переезжает ДО смерти процесса, иначе окно между снятием ключей и смертью
+  # роняло бы 2xx-ACK роутеру как новый запрос
+  @impl true
+  def handle_call({:transfer_ack, new_owner}, _from, state) do
+    :ok = Transport.unreg_tx(state.transport, state.req_key)
+    :ok = Transport.reg_tx(state.transport, state.ack_key, new_owner, :srv)
+    # cleaned: terminate не должен снять перерегистрированный на прокси ACK-ключ;
+    # gen+1 глушит уже извлечённый из почты тик G/H
+    state = %{state | cleaned: true, gen: state.gen + 1, notify: nil}
+    {:stop, :normal, :ok, state}
+  end
+
+  # ACK по диалогу (новый branch) — та же штатная ветка завершения, что и ACK
+  # по ключу из Transport: снятые ключи, гибель, {:tx_acked, ref} владельцу
+  @impl true
+  def handle_call(:external_ack, _from, state) do
+    state = cleanup_keys(state)
+    {:stop, :normal, :ok, %{state | notify: {:tx_acked, state.ref}}}
   end
 
   # §17.2.1: тик IST — ретранслят final (Timer G, шаг T1·2^n с потолком T2)

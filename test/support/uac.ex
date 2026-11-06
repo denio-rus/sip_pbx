@@ -95,6 +95,10 @@ defmodule SipPbxTest.UAC do
   Call-ID и From tag постоянны в обоих запросах, CSeq+1 (регрессия ECSS-10,
   work_log sip_phone §6). Финальный ответ != 2xx отдаётся как
   `{:error, {:status, code, msg}}`.
+
+  Опция `:contact_port` (по умолчанию 55555) — порт в Contact: сценариям
+  Proxy (Task 13) нужен реальный порт сокета, иначе адрес в Contact
+  недостижим для форварда.
   """
   @spec register(sock(), {tuple(), :inet.port_number()}, String.t(), String.t(), keyword()) ::
           {:ok, Message.t()} | {:error, {:status, integer(), Message.t()} | term()}
@@ -105,8 +109,11 @@ defmodule SipPbxTest.UAC do
     cseq = Keyword.get(opts, :cseq_start, 1)
     realm = Keyword.get(opts, :realm, "pbx.local")
     timeout = Keyword.get(opts, :timeout, 2000)
+    # порт Contact = порт сокета (Task 13): binding.received и так берётся из
+    # UDP-источника, но форвард/отладка должны видеть достижимый адрес в Contact
+    contact_port = Keyword.get(opts, :contact_port, 55_555)
 
-    first = register_raw(number, realm, call_id, tag, cseq, expires, nil)
+    first = register_raw(number, realm, call_id, tag, cseq, expires, contact_port)
     send(sock, target, Message.to_binary(first))
 
     case recv(sock, timeout) do
@@ -179,7 +186,7 @@ defmodule SipPbxTest.UAC do
     |> Base.encode16(case: :lower)
   end
 
-  defp register_raw(number, realm, call_id, tag, cseq, expires, _auth) do
+  defp register_raw(number, realm, call_id, tag, cseq, expires, contact_port) do
     %Message{
       type: :request,
       method: "REGISTER",
@@ -190,7 +197,7 @@ defmodule SipPbxTest.UAC do
         {"to", "<sip:#{number}@#{realm}>"},
         {"call-id", call_id},
         {"cseq", "#{cseq} REGISTER"},
-        {"contact", "<sip:#{number}@127.0.0.1:55555;transport=udp>"},
+        {"contact", "<sip:#{number}@127.0.0.1:#{contact_port};transport=udp>"},
         {"expires", "#{expires}"},
         {"content-length", "0"}
       ]

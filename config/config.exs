@@ -8,6 +8,8 @@ config :sip_pbx,
   auth_secret: System.get_env("SIP_PBX_AUTH_SECRET", "change-me-learning-stand"),
   min_expires: 60,
   max_expires: 3600,
+  # лимит живых транзакционных ключей: выше — 503 (спека §6)
+  max_tx: 200,
   # пороги алерт-правил SipPbx.Alerts (мин. выборка tx_timeout_rate — константа в модуле)
   alert_rules: [
     beam_mem_mb: 512,

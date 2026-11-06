@@ -100,6 +100,13 @@ defmodule SipPbx.SIP.Transport do
   @spec lookup_tx(server(), tx_key()) :: pid() | nil
   def lookup_tx(server \\ __MODULE__, key), do: GenServer.call(server, {:lookup_tx, key})
 
+  @doc """
+  Все ключи реестра (для веб-консоли и теста лимита 503). Читалка реестра —
+  как у `lookup_tx/2`: в окно перезапуска транспорта даёт exit `:noproc`.
+  """
+  @spec tx_keys(server()) :: [tx_key()]
+  def tx_keys(server \\ __MODULE__), do: GenServer.call(server, :tx_keys)
+
   @doc "Боевой порт сокета (актуально при `port: 0` в тестах)."
   @spec local_port(server()) :: :inet.port_number()
   def local_port(server \\ __MODULE__), do: GenServer.call(server, :local_port)
@@ -152,6 +159,11 @@ defmodule SipPbx.SIP.Transport do
   end
 
   def handle_call(:tx_count, _from, state), do: {:reply, :ets.info(state.tab, :size), state}
+
+  def handle_call(:tx_keys, _from, state) do
+    keys = :ets.tab2list(state.tab) |> Enum.map(&elem(&1, 0))
+    {:reply, keys, state}
+  end
 
   def handle_call({:lookup_tx, key}, _from, state) do
     case :ets.lookup(state.tab, key) do

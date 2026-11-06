@@ -24,10 +24,12 @@ defmodule SipPbx.Application do
       SipPbx.CallTracker,
       # контейнер ephemeral-транзакций (§17): дети :temporary
       SipPbx.SIP.TxSupervisor,
-      # роутер транспорта до Proxy (Task 13); ДО Transport — тот шлёт ему
-      # почтой по имени, по незарегистрированному имени send/2 падает
+      # REGISTER-логика: процесс нужен, транзакции для него заводит Proxy
       SipPbx.Registrar,
-      {SipPbx.SIP.Transport, router: SipPbx.Registrar}
+      # роутер транспорта (Task 13); ДО Transport — тот шлёт ему почтой по
+      # имени, по незарегистрированному имени send/2 падает
+      SipPbx.Proxy,
+      {SipPbx.SIP.Transport, router: SipPbx.Proxy}
     ]
 
     Supervisor.start_link(children, strategy: :one_for_one, name: SipPbx.Supervisor)

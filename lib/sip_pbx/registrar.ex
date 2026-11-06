@@ -1,22 +1,17 @@
 defmodule SipPbx.Registrar do
   @moduledoc """
-  Регистратор (спека §5): первый живой роутер `Transport` — принимает
-  `{:sip_new_request, msg, from}`, заводит серверную транзакцию (§17.2) и
-  терминирует REGISTER: digest-challenge 401 → сверка → `200` с Contact и
-  согласованным `expires`, `403` без подсказок, `423 Min-Expires`, снятие
-  binding по `Expires: 0`. OPTIONS отвечает `200` с `Allow` (keepalive
-  софтофонов — осознанно вне спеки, §6 «не придираемся»), прочие методы — 405.
-  Ретранслят финала ведёт IST (NIST гаснет по D сама), поэтому письма
-  `{:tx_acked | :tx_timeout_owner | :tx_dup, ...}` здесь игнорируются.
+  Регистратор (спека §5): терминирует REGISTER — digest-challenge 401 →
+  сверка → `200` с Contact и согласованным `expires`, `403` без подсказок,
+  `423 Min-Expires`, снятие binding по `Expires: 0`. С Task 13 роутер
+  `Transport` — `SipPbx.Proxy`; он заводит серверную транзакцию и вызывает
+  REGISTER-логику этим модулем через `GenServer.call(Registrar,
+  {:register, msg, from, tx})`. OPTIONS/405 тоже переехали в Proxy (§6).
   """
 
   use GenServer
 
   alias SipPbx.{Auth, Location, Metrics}
-  alias SipPbx.SIP.{Message, Transport, TxServer, TxSupervisor}
-
-  # OPTIONS keepalive и 405 (§21.4.8 требует Allow в обоих)
-  @allow "REGISTER, INVITE, ACK, CANCEL, BYE"
+  alias SipPbx.SIP.{Message, Transport, TxServer}
 
   @doc "Запустить регистратор под именем `__MODULE__` (роутер Transport)."
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -69,38 +64,13 @@ defmodule SipPbx.Registrar do
   @impl true
   def init(_opts), do: {:ok, %{}}
 
-  # новый запрос: заводим IST/NIST (§17.2) и разбираем по методу; 100 Trying
-  # не шлём — REGISTER терминируется быстрее 200 мс (§17.2.1 требует его только
-  # при отложенном ответе), и тушка UAC читает «следующий пакет», не фильтруя
+  # REGISTER от роутера (Proxy, Task 13): транзакцию и 100 Trying заводит
+  # роутер, здесь только терминация §5; ответ идёт через `tx`
   @impl true
-  def handle_info({:sip_new_request, %Message{type: :request} = msg, from}, state) do
-    {:ok, tx} =
-      DynamicSupervisor.start_child(
-        SipPbx.SIP.TransactionSupervisor,
-        TxSupervisor.tx_child_spec(TxServer,
-          transport: Transport,
-          owner: self(),
-          kind: :other,
-          msg: msg,
-          from: from
-        )
-      )
-
-    case msg.method do
-      "REGISTER" -> handle_register(msg, from, tx)
-      "OPTIONS" -> respond(tx, msg, 200, "OK", [{"allow", @allow}])
-      _ -> respond(tx, msg, 405, "Method Not Allowed", [{"allow", @allow}])
-    end
-
-    {:noreply, state}
+  def handle_call({:register, %Message{} = msg, from, tx}, _from_proc, state) do
+    :ok = handle_register(msg, from, tx)
+    {:reply, :ok, state}
   end
-
-  # ретранслят финала и ACK держит IST; дубликат запроса Transport в IST уже
-  # отдал транзакции — сюда он вернуться не может
-  @impl true
-  def handle_info({:tx_acked, _ref}, state), do: {:noreply, state}
-  def handle_info({:tx_timeout_owner, _ref}, state), do: {:noreply, state}
-  def handle_info({:tx_dup, _msg, _from}, state), do: {:noreply, state}
 
   @impl true
   def handle_info(_msg, state), do: {:noreply, state}
